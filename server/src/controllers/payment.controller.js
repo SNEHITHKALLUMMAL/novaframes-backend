@@ -17,101 +17,57 @@ export const listMyPayments = asyncHandler(async (req, res) => {
 /**
  * Razorpay order creation endpoint.
  * Creates a Razorpay order for the frontend popup checkout.
- * The plan and pricing are determined server-side — the frontend never
- * controls the amount.
+ * Plan and pricing are determined server-side.
  */
 export const createOrder = asyncHandler(async (req, res) => {
-  logger.info('createOrder request received', {
-    requestId: req.id,
-    userId: req.user?._id?.toString(),
-    bodyKeys: Object.keys(req.body || {}),
-    plan: req.body?.plan,
-    billingCycle: req.body?.billingCycle,
+  const provider = getPaymentProvider();
+
+  if (!(provider instanceof RazorpayPaymentProvider)) {
+    throw ApiError.badRequest('Order creation is only available with the Razorpay payment provider');
+  }
+
+  const { plan, billingCycle = 'monthly' } = req.body;
+  const planDefinition = getPlanDefinition(plan);
+
+  if (!planDefinition) {
+    throw ApiError.badRequest(`Unknown plan: ${plan}`);
+  }
+
+  const amountCents =
+    billingCycle === 'yearly' ? planDefinition.priceYearlyCents : planDefinition.priceMonthlyCents;
+
+  if (amountCents === 0) {
+    throw ApiError.badRequest('Free plan does not require payment');
+  }
+
+  const order = await provider.createOrder({
+    userId: req.user._id,
+    planId: plan,
+    billingCycle,
+    amountCents,
   });
 
-  try {
-    const provider = getPaymentProvider();
+  await Payment.create({
+    user: req.user._id,
+    amount: amountCents,
+    currency: 'INR',
+    provider: 'razorpay',
+    status: PAYMENT_STATUS.PENDING,
+    providerSessionId: order.orderId,
+    invoiceUrl: JSON.stringify({ planId: plan, billingCycle }),
+  });
 
-    logger.info('createOrder provider check', {
-      requestId: req.id,
-      providerName: provider?.constructor?.name,
-      isRazorpay: provider instanceof RazorpayPaymentProvider,
-      envProvider: process.env.PAYMENT_PROVIDER,
-      hasKeyId: Boolean(process.env.RAZORPAY_KEY_ID),
-      hasKeySecret: Boolean(process.env.RAZORPAY_KEY_SECRET),
-    });
+  const keyId = provider._keyId || provider.razorpay?.key_id;
 
-    if (!(provider instanceof RazorpayPaymentProvider)) {
-      throw ApiError.badRequest('Order creation is only available with the Razorpay payment provider');
-    }
-
-    const { plan, billingCycle = 'monthly' } = req.body;
-    const planDefinition = getPlanDefinition(plan);
-
-    if (!planDefinition) {
-      throw ApiError.badRequest(`Unknown plan: ${plan}`);
-    }
-
-    const amountCents =
-      billingCycle === 'yearly' ? planDefinition.priceYearlyCents : planDefinition.priceMonthlyCents;
-
-    if (amountCents === 0) {
-      throw ApiError.badRequest('Free plan does not require payment');
-    }
-
-    logger.info('createOrder calling Razorpay', {
-      requestId: req.id,
-      plan,
-      billingCycle,
-      amountCents,
-    });
-
-    const order = await provider.createOrder({
-      userId: req.user._id,
-      planId: plan,
-      billingCycle,
-      amountCents,
-    });
-
-    logger.info('createOrder Razorpay order created', {
-      requestId: req.id,
-      orderId: order?.orderId,
-    });
-
-    await Payment.create({
-      user: req.user._id,
-      amount: amountCents,
-      currency: 'INR',
-      provider: 'razorpay',
-      status: PAYMENT_STATUS.PENDING,
-      providerSessionId: order.orderId,
-      invoiceUrl: JSON.stringify({ planId: plan, billingCycle }),
-    });
-
-    // Safer key access
-    const keyId = provider._keyId || provider.razorpay?.key_id;
-
-    sendSuccess(res, {
-      message: 'Order created',
-      data: {
-        orderId: order.orderId,
-        amount: order.amount,
-        currency: order.currency,
-        keyId,
-      },
-    });
-  } catch (err) {
-    logger.error('createOrder failed', {
-      requestId: req.id,
-      message: err?.message,
-      name: err?.name,
-      statusCode: err?.statusCode,
-      description: err?.error?.description || err?.description,
-      code: err?.error?.code || err?.code,
-      stack: err?.stack,
-    });
-    throw err;
-  }
+  sendSuccess(res, {
+    message: 'Order created',
+    data: {
+      orderId: order.orderId,
+      amount: order.amount,
+      currency: order.currency,
+      keyId,
+    },
+  });
 });
 
 /**
@@ -122,6 +78,7 @@ export const createOrder = asyncHandler(async (req, res) => {
  */
 export const verifyPayment = asyncHandler(async (req, res) => {
   const provider = getPaymentProvider();
+
   if (!(provider instanceof RazorpayPaymentProvider)) {
     throw ApiError.badRequest('Payment verification is only available with the Razorpay payment provider');
   }
@@ -132,14 +89,12 @@ export const verifyPayment = asyncHandler(async (req, res) => {
     throw ApiError.badRequest('Missing required Razorpay payment verification fields');
   }
 
-  // Verify signature server-side
   provider.verifyPaymentSignature({
     orderId: razorpay_order_id,
     paymentId: razorpay_payment_id,
     signature: razorpay_signature,
   });
 
-  // Find the pending payment
   const payment = await Payment.findOne({
     providerSessionId: razorpay_order_id,
     user: req.user._id,
@@ -150,8 +105,8 @@ export const verifyPayment = asyncHandler(async (req, res) => {
     throw ApiError.notFound('No pending payment found for this order');
   }
 
-  // Parse plan info we stored during order creation
-  let planId, billingCycle;
+  let planId;
+  let billingCycle;
   try {
     const meta = JSON.parse(payment.invoiceUrl || '{}');
     planId = meta.planId;
@@ -160,12 +115,10 @@ export const verifyPayment = asyncHandler(async (req, res) => {
     throw ApiError.internal('Could not read payment metadata');
   }
 
-  // Mark payment as succeeded
   payment.status = PAYMENT_STATUS.SUCCEEDED;
   payment.providerPaymentId = razorpay_payment_id;
   await payment.save();
 
-  // Activate subscription via the same webhook-event code path
   await subscriptionService.handleWebhookEvent({
     type: 'payment.captured',
     providerEventId: `verify_${razorpay_payment_id}`,
@@ -185,9 +138,7 @@ export const verifyPayment = asyncHandler(async (req, res) => {
 });
 
 /**
- * Webhook receiver. Deliberately does NOT use requireAuth — the caller is
- * the payment provider's servers, not a logged-in user; authenticity is
- * established by verifying the signature instead.
+ * Webhook receiver. Authenticated by provider signature, not user session.
  */
 export const handleWebhook = asyncHandler(async (req, res) => {
   const provider = getPaymentProvider();
@@ -209,14 +160,15 @@ export const handleWebhook = asyncHandler(async (req, res) => {
 });
 
 /**
- * Dev-only — lets a developer complete a simulated checkout without a real
- * payment provider.
+ * Dev-only — simulate checkout completion when using the dev-stub provider.
  */
 export const simulateDevCheckout = asyncHandler(async (req, res) => {
   const provider = getPaymentProvider();
+
   if (typeof provider.simulateCheckoutCompleted !== 'function') {
     throw ApiError.badRequest('Current payment provider does not support checkout simulation');
   }
+
   const event = provider.simulateCheckoutCompleted(req.params.sessionId);
   await subscriptionService.handleWebhookEvent(event);
   sendSuccess(res, { message: 'Simulated checkout completed', data: { event } });
