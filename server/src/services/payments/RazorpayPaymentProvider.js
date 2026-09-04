@@ -50,16 +50,20 @@ export class RazorpayPaymentProvider {
 
   /**
    * Create a Razorpay Order for the frontend popup checkout.
-   * Returns { orderId, keyId, amount, currency } — enough for the frontend
+   * Returns { orderId, amount, currency } — enough for the frontend
    * to open Razorpay Checkout, never the secret key.
    */
   async createOrder({ userId, planId, billingCycle, amountCents }) {
     await this.#ensureClient();
-    // Razorpay amount is in the smallest currency unit (paise for INR)
+
+    // Razorpay receipt max length = 56 characters
+    const shortId = String(userId).slice(-8);
+    const receipt = `nf_${shortId}_${planId}_${Date.now()}`.slice(0, 40);
+
     const order = await this.razorpay.orders.create({
       amount: amountCents,
       currency: 'INR',
-      receipt: `novaframe_${userId}_${planId}_${billingCycle}_${Date.now()}`,
+      receipt,
       notes: { userId: userId.toString(), planId, billingCycle },
     });
 
@@ -128,7 +132,6 @@ export class RazorpayPaymentProvider {
     switch (event.event) {
       case 'payment.captured':
       case 'payment.authorized': {
-        // Extract plan/billing info from order notes or metadata
         const notes = payment.notes || {};
         return {
           providerPaymentId: payment.id,
